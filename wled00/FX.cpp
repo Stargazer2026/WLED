@@ -6880,6 +6880,92 @@ void mode_midnoise(void) {                  // Midnoise. By Andrew Tuline.
 static const char _data_FX_MODE_MIDNOISE[] PROGMEM = "Midnoise@Fade rate,Max. length;!,!;!;1v;ix=128,m12=1,si=0"; // Bar, Beatsin
 
 
+/////////////////////////////
+//   * MIDNOISE ONSET      //
+/////////////////////////////
+void mode_midnoiseonset(void) {             // MidNoise variant: expansion driven by spectral onsets.
+  if (SEGLEN <= 1) FX_FALLBACK_STATIC;
+
+  struct MidNoiseOnsetData {
+    uint8_t  prevFft[16];   // previous FFT frame, used for spectral flux
+    float    fluxAvg;       // adaptive baseline of normalized flux (for onset extraction)
+    float    onsetEnv;      // onset envelope with fast attack / slower decay
+    uint16_t noiseX;        // noise animation position X
+    uint16_t noiseY;        // noise animation position Y
+    bool     primed;        // true once prevFft has been initialized from real data
+  };
+
+  unsigned dataSize = sizeof(MidNoiseOnsetData);
+  if (!SEGENV.allocateData(dataSize)) FX_FALLBACK_STATIC;
+  MidNoiseOnsetData* data = reinterpret_cast<MidNoiseOnsetData*>(SEGENV.data);
+
+  um_data_t *um_data = getAudioData();
+  float volumeSmth   = *(float*)  um_data->u_data[0];
+  uint8_t *fftResult =  (uint8_t*) um_data->u_data[2];
+
+  if (SEGENV.call == 0) {
+    memset(data, 0, dataSize);
+    data->noiseX = hw_random16();
+    data->noiseY = hw_random16();
+  }
+
+  SEGMENT.fade_out(SEGMENT.speed);
+  SEGMENT.fade_out(SEGMENT.speed);
+
+  // Spectral flux onset detector:
+  // sum positive per-band changes (current - previous), normalized by current spectral energy.
+  // We keep an adaptive baseline so only sudden increases become "onset" pulses.
+  float flux = 0.0f;
+  float energy = 0.0f;
+  for (uint8_t band = 1; band < 13; band++) { // mostly musical bins, skip DC-ish bin 0 and very top bins
+    float curr = fftResult[band];
+    float prev = data->prevFft[band];
+    float d = curr - prev;
+    if (d > 0.0f) flux += d;
+    energy += curr;
+    data->prevFft[band] = (uint8_t)curr;
+  }
+
+  // Avoid an artificial pulse right after effect start/reset.
+  if (!data->primed) {
+    data->primed = true;
+    return;
+  }
+
+  // Onset stays dominant; base energy only adds a small fill so dense passages feel fuller.
+  float sensitivity = 0.45f + (float)SEGMENT.intensity / 128.0f; // slider 2
+  float onsetNorm   = (flux * 255.0f) / (energy + 96.0f);        // robust against AGC level shifts
+  data->fluxAvg += 0.08f * (onsetNorm - data->fluxAvg);
+  float onsetOnly  = fmaxf(0.0f, onsetNorm - (data->fluxAvg * 1.12f + 4.0f));
+  float onsetDrive = fminf(255.0f, onsetOnly * sensitivity * 3.2f);
+  float baseDrive  = fminf(255.0f, (energy / 12.0f) * 0.18f);     // secondary fill component only
+  float targetDrive = fminf(255.0f, onsetDrive + baseDrive);
+
+  // Envelope: immediate rise on onsets, controlled decay (slider 1).
+  if (targetDrive > data->onsetEnv) {
+    data->onsetEnv = targetDrive;
+  } else {
+    float decayStep = mapf((float)SEGMENT.speed, 0.0f, 255.0f, 1.4f, 16.0f); // slider 1
+    data->onsetEnv = fmaxf(0.0f, data->onsetEnv - decayStep);
+  }
+
+  unsigned maxLen = mapf(data->onsetEnv, 0, 255, 0, SEGLEN/2);
+  if (maxLen > SEGLEN/2) maxLen = SEGLEN/2;
+
+  for (unsigned i = (SEGLEN/2 - maxLen); i < (SEGLEN/2 + maxLen); i++) {
+    // keep the organic MidNoise look: local palette index comes from animated Perlin noise field.
+    uint8_t index = perlin8((i << 1) + data->noiseX + (uint16_t)data->onsetEnv,
+                            data->noiseY + i + ((uint16_t)volumeSmth >> 1));
+    SEGMENT.setPixelColor(i, SEGMENT.color_from_palette(index, false, PALETTE_SOLID_WRAP, 0));
+  }
+
+  // Keep noise field moving even when width is small.
+  data->noiseX += beatsin8_t(5, 1, 11);
+  data->noiseY += beatsin8_t(4, 1, 10);
+} // mode_midnoiseonset()
+static const char _data_FX_MODE_MIDNOISEONSET[] PROGMEM = "MidNoiseOnset@Decay,Sensitivity;!,!;!;1v;ix=180,m12=1,si=0";
+
+
 //////////////////////
 //   * NOISEFIRE    //
 //////////////////////
@@ -10890,6 +10976,7 @@ void WS2812FX::setupEffectData() {
   addEffect(FX_MODE_PLASMOID, &mode_plasmoid, _data_FX_MODE_PLASMOID);
   addEffect(FX_MODE_PUDDLES, &mode_puddles, _data_FX_MODE_PUDDLES);
   addEffect(FX_MODE_MIDNOISE, &mode_midnoise, _data_FX_MODE_MIDNOISE);
+  addEffect(FX_MODE_MIDNOISEONSET, &mode_midnoiseonset, _data_FX_MODE_MIDNOISEONSET);
   addEffect(FX_MODE_NOISEMETER, &mode_noisemeter, _data_FX_MODE_NOISEMETER);
   addEffect(FX_MODE_FREQWAVE, &mode_freqwave, _data_FX_MODE_FREQWAVE);
   addEffect(FX_MODE_FREQMATRIX, &mode_freqmatrix, _data_FX_MODE_FREQMATRIX);
