@@ -6890,6 +6890,8 @@ void mode_midnoiseonset(void) {             // MidNoise variant: expansion drive
     uint8_t  prevFft[16];   // previous FFT frame, used for spectral flux
     float    fluxAvg;       // adaptive baseline of normalized flux (for onset extraction)
     float    onsetEnv;      // onset envelope with fast attack / slower decay
+    float    peakCand;      // short-lived onset peak candidate (for delayed trigger)
+    uint8_t  peakAge;       // frames since candidate was last improved
     uint16_t noiseX;        // noise animation position X
     uint16_t noiseY;        // noise animation position Y
     bool     primed;        // true once prevFft has been initialized from real data
@@ -6915,13 +6917,23 @@ void mode_midnoiseonset(void) {             // MidNoise variant: expansion drive
   // Spectral flux onset detector:
   // sum positive per-band changes (current - previous), normalized by current spectral energy.
   // We keep an adaptive baseline so only sudden increases become "onset" pulses.
+  // Musically biased weighting for flux contribution:
+  // stronger in low/low-mid bands (kick, bass, snare body), weaker in upper bands
+  // (cymbals, sibilants, bright transients).
+  static const float fluxBandWeight[13] = {
+    0.0f, // band 0 (unused)
+    1.55f, 1.45f, 1.35f, 1.25f, // lows / low-mids
+    1.12f, 1.00f, 0.88f, 0.76f, // mids
+    0.65f, 0.56f, 0.48f, 0.42f  // upper mids / highs
+  };
+
   float flux = 0.0f;
   float energy = 0.0f;
   for (uint8_t band = 1; band < 13; band++) { // mostly musical bins, skip DC-ish bin 0 and very top bins
     float curr = fftResult[band];
     float prev = data->prevFft[band];
     float d = curr - prev;
-    if (d > 0.0f) flux += d;
+    if (d > 0.0f) flux += d * fluxBandWeight[band];
     energy += curr;
     data->prevFft[band] = (uint8_t)curr;
   }
@@ -6937,7 +6949,27 @@ void mode_midnoiseonset(void) {             // MidNoise variant: expansion drive
   float onsetNorm   = (flux * 255.0f) / (energy + 96.0f);        // robust against AGC level shifts
   data->fluxAvg += 0.08f * (onsetNorm - data->fluxAvg);
   float onsetOnly  = fmaxf(0.0f, onsetNorm - (data->fluxAvg * 1.12f + 4.0f));
-  float onsetDrive = fminf(255.0f, onsetOnly * sensitivity * 3.2f);
+
+  // Tiny delayed-onset peak-picking:
+  // keep a short candidate peak for up to 2 frames and fire that peak when growth stalls or drops.
+  // This shifts trigger emphasis from "first rise" to the nearby local impact without adding obvious lag.
+  if (onsetOnly > 0.0f) {
+    if (onsetOnly >= data->peakCand) {
+      data->peakCand = onsetOnly;
+      data->peakAge = 0;
+    } else if (data->peakAge < 3) {
+      data->peakAge++;
+    }
+  }
+
+  bool releasePeak = (data->peakCand > 0.0f) && (data->peakAge >= 2 || onsetOnly < data->peakCand * 0.78f);
+  float onsetPicked = releasePeak ? data->peakCand : (onsetOnly * 0.25f); // keep subtle pre-motion during builds
+  if (releasePeak) {
+    data->peakCand = 0.0f;
+    data->peakAge = 0;
+  }
+
+  float onsetDrive = fminf(255.0f, onsetPicked * sensitivity * 3.2f);
   float baseDrive  = fminf(255.0f, (energy / 12.0f) * 0.18f);     // secondary fill component only
   float targetDrive = fminf(255.0f, onsetDrive + baseDrive);
 
