@@ -6998,6 +6998,90 @@ void mode_midnoiseonset(void) {             // MidNoise variant: expansion drive
 static const char _data_FX_MODE_MIDNOISEONSET[] PROGMEM = "MidNoiseOnset@Decay,Sensitivity;!,!;!;1v;ix=180,m12=1,si=0";
 
 
+/////////////////////////////
+//   * MIDNOISE ENERGY     //
+/////////////////////////////
+void mode_midnoiseenergy(void) {            // MidNoise variant: expansion follows sustained spectral energy.
+  if (SEGLEN <= 1) FX_FALLBACK_STATIC;
+
+  struct MidNoiseEnergyData {
+    float    energyEnv;     // smoothed weighted spectral energy envelope (0..255)
+    uint16_t noiseX;        // noise animation position X
+    uint16_t noiseY;        // noise animation position Y
+  };
+
+  unsigned dataSize = sizeof(MidNoiseEnergyData);
+  if (!SEGENV.allocateData(dataSize)) FX_FALLBACK_STATIC;
+  MidNoiseEnergyData* data = reinterpret_cast<MidNoiseEnergyData*>(SEGENV.data);
+
+  um_data_t *um_data = getAudioData();
+  uint8_t *fftResult = (uint8_t*)um_data->u_data[2];
+
+  if (SEGENV.call == 0) {
+    memset(data, 0, dataSize);
+    data->noiseX = hw_random16();
+    data->noiseY = hw_random16();
+  }
+
+  SEGMENT.fade_out(SEGMENT.speed);
+  SEGMENT.fade_out(SEGMENT.speed);
+
+  // Weighted musical energy:
+  // stronger low/low-mid contribution, softer upper-mid/high contribution.
+  static const float energyBandWeight[13] = {
+    0.0f, // band 0 (unused)
+    1.60f, 1.50f, 1.40f, 1.28f,
+    1.16f, 1.04f, 0.92f, 0.80f,
+    0.68f, 0.58f, 0.50f, 0.44f
+  };
+
+  float weightedEnergy = 0.0f;
+  float weightSum = 0.0f;
+  for (uint8_t band = 1; band < 13; band++) {
+    float w = energyBandWeight[band];
+    weightedEnergy += (float)fftResult[band] * w;
+    weightSum += w;
+  }
+
+  float energyNorm = (weightSum > 0.0f) ? (weightedEnergy / weightSum) : 0.0f; // roughly 0..255
+
+  // Slider 2 = sensitivity/gain for spectral energy-to-width mapping.
+  float sensitivity = mapf((float)SEGMENT.intensity, 0.0f, 255.0f, 0.80f, 2.80f);
+  float targetEnergy = fminf(255.0f, energyNorm * sensitivity);
+
+  // Envelope smoothing:
+  // attack is intentionally moderate (stable), decay is controlled by slider 1.
+  // low slider 1 => slower release, high slider 1 => faster pullback.
+  if (targetEnergy > data->energyEnv) {
+    data->energyEnv += (targetEnergy - data->energyEnv) * 0.20f;
+  } else {
+    float decayStep = mapf((float)SEGMENT.speed, 0.0f, 255.0f, 0.35f, 7.50f);
+    data->energyEnv = fmaxf(0.0f, data->energyEnv - decayStep);
+  }
+
+  // Soft noise floor gate so near-silence can collapse close to zero.
+  float drawEnergy = (data->energyEnv > 2.0f) ? (data->energyEnv - 2.0f) : 0.0f;
+  // Compress the top end slightly: hit full visual width before absolute max energy.
+  float widthEnergy = fminf(drawEnergy, 250.0f);
+  unsigned maxLen = mapf(widthEnergy, 0, 250, 0, SEGLEN/2);
+  if (maxLen > SEGLEN/2) maxLen = SEGLEN/2;
+
+  if (maxLen > 0) {
+    unsigned left  = (SEGLEN/2) - maxLen;
+    unsigned right = (SEGLEN/2) + maxLen - 1 + (SEGLEN & 0x01); // odd lengths need the center pixel included
+    for (unsigned i = left; i <= right; i++) {
+      uint8_t index = perlin8((i << 1) + data->noiseX + ((uint16_t)data->energyEnv >> 1),
+                              data->noiseY + i + ((uint16_t)data->energyEnv >> 2));
+      SEGMENT.setPixelColor(i, SEGMENT.color_from_palette(index, false, PALETTE_SOLID_WRAP, 0));
+    }
+  }
+
+  data->noiseX += beatsin8_t(5, 1, 11);
+  data->noiseY += beatsin8_t(4, 1, 10);
+} // mode_midnoiseenergy()
+static const char _data_FX_MODE_MIDNOISEENERGY[] PROGMEM = "MidNoiseEnergy@Decay,Sensitivity;!,!;!;1v;ix=180,m12=1,si=0";
+
+
 //////////////////////
 //   * NOISEFIRE    //
 //////////////////////
@@ -11009,6 +11093,7 @@ void WS2812FX::setupEffectData() {
   addEffect(FX_MODE_PUDDLES, &mode_puddles, _data_FX_MODE_PUDDLES);
   addEffect(FX_MODE_MIDNOISE, &mode_midnoise, _data_FX_MODE_MIDNOISE);
   addEffect(FX_MODE_MIDNOISEONSET, &mode_midnoiseonset, _data_FX_MODE_MIDNOISEONSET);
+  addEffect(FX_MODE_MIDNOISEENERGY, &mode_midnoiseenergy, _data_FX_MODE_MIDNOISEENERGY);
   addEffect(FX_MODE_NOISEMETER, &mode_noisemeter, _data_FX_MODE_NOISEMETER);
   addEffect(FX_MODE_FREQWAVE, &mode_freqwave, _data_FX_MODE_FREQWAVE);
   addEffect(FX_MODE_FREQMATRIX, &mode_freqmatrix, _data_FX_MODE_FREQMATRIX);
